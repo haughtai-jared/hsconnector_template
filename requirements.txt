@@ -1,0 +1,7 @@
+# Runtime dependencies, pinned exactly.
+#
+# Pinned because this file builds the container image: a deploy should not discover
+# an incompatible MCP SDK major version at runtime.
+mcp==2.2.0        # the MCP SDK (MCPServer, streamable-HTTP transport)
+starlette==1.7.0  # the ASGI framework the SDK builds the application on
+uvicorn==0.54.0   # the ASGI server that Cloud Run runs

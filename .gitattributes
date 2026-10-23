@@ -1,0 +1,7 @@
+# Keep line endings predictable across platforms.
+#
+# `deploy.sh` runs on Linux, macOS, and WSL, where a CRLF shebang line fails with
+# "bad interpreter: /usr/bin/env bash^M". Forcing LF for shell scripts prevents it.
+* text=auto
+*.sh text eol=lf
+Dockerfile text eol=lf

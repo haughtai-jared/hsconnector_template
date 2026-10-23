@@ -1,0 +1,13 @@
+# Keep the build context small. Everything not listed here is uploaded to Cloud
+# Build, whether or not the Dockerfile copies it.
+
+.git
+.gitignore
+.venv
+__pycache__
+*.py[cod]
+.pytest_cache
+.env
+README.md
+deploy.sh
+deploy.ps1
