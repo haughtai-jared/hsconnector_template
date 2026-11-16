@@ -2,12 +2,16 @@
 # Build, whether or not the Dockerfile copies it.
 
 .git
+.gitattributes
 .gitignore
 .venv
 __pycache__
 *.py[cod]
 .pytest_cache
 .env
+.env.*
 README.md
 deploy.sh
 deploy.ps1
+set-token.sh
+set-token.ps1

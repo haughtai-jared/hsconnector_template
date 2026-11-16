@@ -13,6 +13,16 @@ ENV PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
     PORT=8080
 
+# The variable is declared here, with a placeholder, so it is populated even when
+# nothing sets it on the platform: a revision that omits MCP_AUTH_TOKEN entirely
+# makes its state ambiguous, and the deploy scripts would have to guess. A real
+# token on the Cloud Run service overrides this value.
+#
+# The placeholder is public, so it is not a credential: app/main.py treats it
+# exactly like an empty value and answers 503 to every request. set-token.ps1 /
+# set-token.sh replace it with the token the auth server issues.
+ENV MCP_AUTH_TOKEN=replace-with-issued-token
+
 WORKDIR /srv
 
 # Dependencies first, so this layer is only rebuilt when requirements.txt changes

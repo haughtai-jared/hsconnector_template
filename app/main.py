@@ -1,8 +1,15 @@
 """The ASGI application Cloud Run runs.
 
 `uvicorn app.main:app` is the entire entrypoint. The MCP SDK builds the
-streamable-HTTP application; this module adds the shared-key check in front of it
+streamable-HTTP application; this module puts the bearer-token gate in front of it
 and supplies the transport settings that suit Cloud Run.
+
+The gate is always closed. `MCP_AUTH_TOKEN` is empty on the first deploy, because
+the token does not exist until the deployed URL has been registered with the apex
+auth server. Empty is therefore a normal state, not a reason to stop checking:
+while it is empty every request is answered `503`, and once it holds the issued
+token every request must carry it as `Authorization: Bearer <token>`. There is no
+configuration in which this service serves traffic without a token.
 
 Cloud Run specifics worth knowing:
 
@@ -18,6 +25,7 @@ Cloud Run specifics worth knowing:
 
 from __future__ import annotations
 
+import hashlib
 import hmac
 import logging
 import os
@@ -26,89 +34,157 @@ from starlette.datastructures import Headers
 from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Receive, Scope, Send
 
-from app.server import HEALTH_PATH, MCP_PATH, server
+from app.server import MCP_PATH, server, status_payload
 
 log = logging.getLogger(__name__)
 
-# The shared key every request must carry.
+# The value deployed while no token has been issued yet.
 #
-# Read once, at import, from the environment. Unset or empty means the check is
-# OFF, which is what lets a fresh clone run locally with no configuration. Set it
-# on the deployed service (see deploy.ps1 / deploy.sh, or `gcloud run services
-# update --update-env-vars`).
+# The deploy scripts always write MCP_AUTH_TOKEN, so the variable is never simply
+# missing from a revision: a revision that does not declare it is ambiguous, and
+# `--update-env-vars` later has to guess. It starts as this placeholder instead,
+# which is visible in the Cloud Run console and unmistakably "not the real token".
+#
+# It is never accepted as a token. It is public — it is in this file, the
+# Dockerfile, and both deploy scripts — so the gate treats it exactly like an empty
+# value: every request answers 503. Keep this string identical in Dockerfile,
+# deploy.ps1, deploy.sh, set-token.ps1, and set-token.sh.
+PLACEHOLDER_TOKEN = "replace-with-issued-token"
+
+# The MCP token this deployment expects on every request.
+#
+# It is the token the apex auth server issued for this service's URL. Read once,
+# at import, from the environment; a new revision re-imports, so `gcloud run
+# services update --update-env-vars` (or set-token.ps1 / set-token.sh) is enough
+# to rotate it without a rebuild.
+#
+# Empty or the placeholder means "not authorized yet", never "no auth required".
 AUTH_TOKEN = (os.environ.get("MCP_AUTH_TOKEN") or "").strip()
 
-# Paths that never require the key. A Cloud Run health probe comes from the
-# platform rather than from the connector, so it carries no credentials.
-AUTH_EXEMPT_PATHS = frozenset({HEALTH_PATH})
+# What the gate actually compares against. "" means "not authorized yet".
+EXPECTED_TOKEN = "" if AUTH_TOKEN in ("", PLACEHOLDER_TOKEN) else AUTH_TOKEN
 
 AUTH_HEADER = "authorization"
+BEARER_SCHEME = "bearer"
 
 
-def supplied_token(headers: Headers) -> str:
-    """The key this request carries, or "" when it carries none.
+def bearer_token(headers: Headers) -> str:
+    """The bearer token this request carries, or "" when it carries none.
 
-    `Authorization: Bearer mcp_abc123` is the form an MCP connector uses. The
-    scheme is matched case-insensitively and stripped; everything after it is the
-    key, exactly as issued — so a token that begins with `mcp_` needs no special
-    handling and is compared verbatim.
+    The auth server forwards every authorized request with
+    `Authorization: Bearer <token>`, so that is the one form accepted here. The
+    scheme is matched case-insensitively (RFC 9110); everything after the single
+    space is the token, compared verbatim — a token that begins with `mcp_` needs
+    no special handling.
 
-    A bare token with no scheme is also accepted, because some clients send one,
-    and rejecting it would look like a wrong key rather than a missing scheme.
+    A token sent with no scheme is refused rather than accepted leniently: a
+    deployment that only ever receives traffic through the auth server should not
+    accept a shape the auth server never sends.
     """
     value = (headers.get(AUTH_HEADER) or "").strip()
     if not value:
         return ""
     scheme, _, credential = value.partition(" ")
-    if scheme.lower() == "bearer":
-        return credential.strip()
-    return value
+    if scheme.lower() != BEARER_SCHEME:
+        return ""
+    return credential.strip()
 
 
-class SharedKeyMiddleware:
-    """Reject any request that does not carry the shared key.
+def token_fingerprint(token: str) -> str:
+    """A short, one-way label for a token, so logs can say which one is loaded.
 
-    This is one shared secret, not a user directory: it answers "did this request
-    come through the connector that holds the key", and nothing more. That is the
-    right amount of machinery for a template, and it stops a leaked service URL
-    from being usable on its own.
+    Eight hex characters of SHA-256 identify a token well enough to compare the
+    deployed value against the one the auth server holds, and reveal nothing that
+    could be replayed.
+    """
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:8]
 
-    Two details matter:
+
+class BearerTokenMiddleware:
+    """Refuse any request that does not carry the MCP token.
+
+    Every HTTP request is checked — the MCP endpoint, `/health`, and anything
+    added later — because the auth server puts the token on all traffic it
+    forwards. A request without the token did not come through the auth server,
+    so it is not authorized.
+
+    That uniformity is also what makes the approval probe meaningful: the auth
+    server's `GET` succeeds only if the token it holds is the token this
+    deployment expects. An exempt path would answer `200` for the wrong token.
+
+    Three details matter:
 
     * **It runs first.** `app.add_middleware` makes this the outermost layer, so
       an unauthenticated request is refused before its body is read and before
       the MCP transport sees it.
-    * **Comparison is `hmac.compare_digest`**, so the check does not leak the key
-      one byte at a time through how long it takes to fail.
+    * **Comparison is `hmac.compare_digest`** over bytes, so the check does not
+      leak the token one byte at a time through how long it takes to fail, and a
+      non-ASCII byte in a header cannot raise.
+    * **An unset token refuses rather than admits.** `503` says "deployed, not yet
+      authorized", which is exactly the state between deploy and approval.
 
     Lifespan and websocket messages pass through untouched. That is not a bypass:
     the MCP session manager's lifespan has to reach the app or every request
     after startup fails, and it is not an HTTP request a client can send.
     """
 
-    def __init__(self, app: ASGIApp, token: str,
-                 exempt_paths: frozenset[str] = frozenset()) -> None:
+    def __init__(self, app: ASGIApp, token: str) -> None:
         self.app = app
-        self.token = token
-        self.exempt_paths = exempt_paths
+        self.expected = token.encode("utf-8")
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] != "http" or scope.get("path") in self.exempt_paths:
+        if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
 
-        supplied = supplied_token(Headers(scope=scope))
-        if supplied and hmac.compare_digest(supplied, self.token):
+        if not self.expected:
+            log.warning(
+                "refused a request to %s: MCP_AUTH_TOKEN is empty, so this "
+                "deployment is deployed but not yet authorized",
+                scope.get("path"),
+            )
+            response = JSONResponse(
+                {
+                    "error": "not_configured",
+                    "detail": (
+                        "This deployment has no MCP token yet. Register its URL "
+                        "with the auth server, set MCP_AUTH_TOKEN to the issued "
+                        "token, then retry."
+                    ),
+                },
+                status_code=503,
+            )
+            await response(scope, receive, send)
+            return
+
+        supplied = bearer_token(Headers(scope=scope))
+        if supplied and hmac.compare_digest(
+            supplied.encode("utf-8"), self.expected
+        ):
+            # A `GET` on the MCP path is the streamable transport's request to open
+            # an SSE stream. This server runs stateless and answers in JSON, so
+            # there is no stream to open and the request would simply be held — a
+            # probe against the registered URL would hang instead of returning.
+            # Answering it makes the MCP URL itself work as the approval probe.
+            if scope.get("method") == "GET" and scope.get("path") == MCP_PATH:
+                response = JSONResponse(status_payload())
+                await response(scope, receive, send)
+                return
             await self.app(scope, receive, send)
             return
 
-        # Says nothing about whether a key was supplied, or how close it was. The
-        # log line is the place for that, not the response.
-        log.warning("rejected a request to %s with %s", scope.get("path"),
-                    "no key" if not supplied else "the wrong key")
+        # Says nothing about whether a token was supplied, or how close it was.
+        # The log line is the place for that, not the response.
+        log.warning(
+            "rejected a request to %s with %s",
+            scope.get("path"),
+            "no bearer token" if not supplied else "the wrong bearer token",
+        )
         response = JSONResponse(
-            {"error": "unauthorized",
-             "detail": "Send the shared key as `Authorization: Bearer <key>`."},
+            {
+                "error": "unauthorized",
+                "detail": "Send the MCP token as `Authorization: Bearer <token>`.",
+            },
             status_code=401,
             headers={"WWW-Authenticate": 'Bearer realm="mcp"'},
         )
@@ -139,21 +215,27 @@ def build_app():
         host="0.0.0.0",
     )
 
-    if AUTH_TOKEN:
-        app.add_middleware(
-            SharedKeyMiddleware,
-            token=AUTH_TOKEN,
-            exempt_paths=AUTH_EXEMPT_PATHS,
-        )
+    app.add_middleware(BearerTokenMiddleware, token=EXPECTED_TOKEN)
+
+    if EXPECTED_TOKEN:
         log.info(
-            "shared-key check ON: every request except %s must send "
-            "`Authorization: Bearer <key>`", ", ".join(sorted(AUTH_EXEMPT_PATHS)),
+            "MCP token ON (sha256 %s): every request must send "
+            "`Authorization: ******",
+            token_fingerprint(EXPECTED_TOKEN),
+        )
+    elif AUTH_TOKEN == PLACEHOLDER_TOKEN:
+        log.warning(
+            "MCP_AUTH_TOKEN is still the deploy placeholder (%r), so every "
+            "request answers 503 until the token issued by the auth server is "
+            "set. That is the normal state right after a deploy; run "
+            "set-token.ps1 / set-token.sh to finish.",
+            PLACEHOLDER_TOKEN,
         )
     else:
         log.warning(
-            "MCP_AUTH_TOKEN is unset, so the check is OFF and %s accepts anything "
-            "that can reach it. That is fine for a local run; set MCP_AUTH_TOKEN "
-            "before deploying anything that matters.", MCP_PATH,
+            "MCP_AUTH_TOKEN is empty, so every request answers 503 until the "
+            "token issued by the auth server is set. Deploying in this state "
+            "is expected (the token does not exist yet); serving in it is not.",
         )
 
     return app

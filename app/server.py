@@ -19,9 +19,10 @@ from starlette.responses import JSONResponse
 SERVER_NAME = "hsconnector-template"
 SERVER_VERSION = "0.1.0"
 
-# The paths a client uses. `/mcp` is this server's endpoint; `/health` is for a
-# probe or a human with curl. `/healthz` is deliberately not used: Google's front
-# end answers that path on a *.run.app host before a request reaches the container.
+# The paths a client uses. `/mcp` is this server's endpoint; `/health` is the
+# approval/readiness check the auth server calls after the token is set.
+# `/healthz` is deliberately not used: Google's front end answers that path on a
+# *.run.app host before a request reaches the container.
 MCP_PATH = "/mcp"
 HEALTH_PATH = "/health"
 
@@ -61,14 +62,29 @@ def get_current_time() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def status_payload() -> dict[str, str]:
+    """The body a readiness/approval `GET` returns.
+
+    Shared by `/health` and by `GET /mcp` (answered in `app.main`) so the auth
+    server's approval probe gets the same answer whichever URL it targets.
+    """
+    return {
+        "status": "ok",
+        "service": SERVER_NAME,
+        "version": SERVER_VERSION,
+        "mcp_endpoint": MCP_PATH,
+        "auth": "bearer",
+    }
+
+
 @server.custom_route(HEALTH_PATH, methods=["GET"], include_in_schema=False)
 async def health(_request: Request) -> JSONResponse:
-    """Liveness check for Cloud Run, a load balancer, or a quick curl."""
-    return JSONResponse(
-        {
-            "status": "ok",
-            "service": SERVER_NAME,
-            "version": SERVER_VERSION,
-            "mcp_endpoint": MCP_PATH,
-        }
-    )
+    """Readiness check, answering only to a request that carries the MCP token.
+
+    The gate lives in `app.main`, not here, so this route only runs once the
+    bearer token has been accepted. That is what makes it the approval probe: the
+    auth server's `GET /health` returns `200` only when the token it holds is the
+    token this deployment expects. A deployment with no token set answers `503`
+    and never reaches this function.
+    """
+    return JSONResponse(status_payload())
